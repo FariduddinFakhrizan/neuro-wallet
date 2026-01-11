@@ -1,22 +1,68 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue';
 import axios from 'axios';
+import QrcodeVue from 'qrcode.vue';
+import { jsPDF } from 'jspdf';
+import ProfileSettings from './components/ProfileSettings.vue';
+import Contacts from './components/Contacts.vue';
+import Notifications from './components/Notifications.vue';
+import RecurringPayments from './components/RecurringPayments.vue';
+import PaymentRequests from './components/PaymentRequests.vue';
+import PendingApprovals from './components/PendingApprovals.vue';
+import Analytics from './components/Analytics.vue';
 
 // --- State Management ---
 const user = ref(JSON.parse(localStorage.getItem('wallet_user')) || null);
+const token = ref(localStorage.getItem('jwt_token') || null);
 const isLoginView = ref(true);
+const currentView = ref('dashboard'); // 'dashboard', 'profile', 'contacts', 'notifications', 'recurring', 'payment-requests', 'approvals', 'analytics'
+const notificationsRef = ref(null);
+const unreadNotifCount = ref(0);
 const authForm = ref({ username: '', password: '' });
+const isDarkMode = ref(localStorage.getItem('darkMode') === 'true');
+const isMobileMenuOpen = ref(false); // Mobile menu state
+
+// Transaction Categories
+const categories = ['OTHER', 'RENT', 'FOOD', 'SALARY', 'ENTERTAINMENT', 'UTILITIES', 'SHOPPING', 'HEALTHCARE', 'TRANSPORT', 'EDUCATION'];
+const selectedCategory = ref('OTHER');
+const transactionNote = ref('');
 
 // Wallet Data
 const balance = ref(0);
-const recipientId = ref('');
+const recipientInput = ref('');
 const amount = ref(0);
 const transactions = ref([]);
-const searchQuery = ref('');
 const sortBy = ref('newest'); 
 const isProcessing = ref(false);
 const showSuccessToast = ref(false);
 const errorMessage = ref('');
+
+// Analytics & Search
+const searchCategory = ref('');
+const searchQuery = ref('');
+const searchDateFrom = ref('');
+const searchDateTo = ref('');
+
+// --- Axios Config ---
+// Add JWT to all requests
+axios.interceptors.request.use(config => {
+  if (token.value) {
+    config.headers.Authorization = `Bearer ${token.value}`;
+  }
+  return config;
+});
+
+// Handle 401 Unauthorized
+axios.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response && error.response.status === 401) {
+      logout();
+      errorMessage.value = "Session expired. Please login again.";
+    }
+    return Promise.reject(error);
+  }
+);
 
 // --- Computed ---
 const filteredTransactions = computed(() => {
@@ -44,11 +90,26 @@ const login = async () => {
   
   try {
     const res = await axios.post('http://localhost:8080/api/auth/login', authForm.value);
-    user.value = res.data;
+    
+    // Store JWT token and user info
+    token.value = res.data.token;
+    localStorage.setItem('jwt_token', token.value);
+    
+    // Construct user object (backend returns id, username, token)
+    user.value = {
+      id: res.data.userId,
+      username: res.data.username
+    };
+    
+    // Fetch full user details to get avatar
+    const userRes = await axios.get(`http://localhost:8080/api/users/${user.value.id}`);
+    user.value = userRes.data;
+    
     localStorage.setItem('wallet_user', JSON.stringify(user.value));
+    currentView.value = 'dashboard';
     await fetchWalletData();
   } catch (error) {
-    errorMessage.value = 'Identity verification failed. Check credentials.';
+    errorMessage.value = error.response?.data?.message || 'Access denied. Check credentials.';
   } finally {
     isProcessing.value = false;
   }
@@ -64,14 +125,14 @@ const register = async () => {
     isLoginView.value = true;
     showToast("Profile Created Successfully");
   } catch (error) {
-    errorMessage.value = 'Registration rejected. Username may be taken.';
+    errorMessage.value = error.response?.data?.message || 'Registration rejected.';
   } finally {
     isProcessing.value = false;
   }
 };
 
 const fetchWalletData = async () => {
-  if (!user.value) return;
+  if (!user.value || !token.value) return;
   try {
     // Fetch actual balance from database
     const balanceRes = await axios.get(`http://localhost:8080/api/wallet/balance/${user.value.id}`);
@@ -90,22 +151,29 @@ const handleTransfer = async () => {
     errorMessage.value = "Insufficient balance in vault.";
     return;
   }
-  if (!recipientId.value || amount.value <= 0) return;
+  if (!recipientInput.value || amount.value <= 0) return;
 
   isProcessing.value = true;
   try {
-    await axios.post('http://localhost:8080/api/wallet/transfer', {
+    const payload = {
       fromUserId: user.value.id,
-      toUserId: recipientId.value,
       amount: amount.value
-    });
+    };
+
+    if (!isNaN(recipientInput.value)) {
+      payload.toUserId = Number(recipientInput.value);
+    } else {
+      payload.toUsername = recipientInput.value;
+    }
+
+    await axios.post('http://localhost:8080/api/wallet/transfer', payload);
     
     showToast(`Transfer successful: RM ${amount.value.toFixed(2)}`);
-    recipientId.value = '';
+    recipientInput.value = '';
     amount.value = 0;
     await fetchWalletData();
   } catch (error) {
-    errorMessage.value = "Transaction rejected by system.";
+    errorMessage.value = error.response?.data?.message || "Transaction rejected by system.";
   } finally {
     isProcessing.value = false;
   }
@@ -118,12 +186,76 @@ const showToast = (msg) => {
 
 const logout = () => {
   user.value = null;
+  token.value = null;
   localStorage.removeItem('wallet_user');
+  localStorage.removeItem('jwt_token');
   authForm.value = { username: '', password: '' };
+  currentView.value = 'dashboard';
+};
+
+const updateUserData = (updatedUser) => {
+  user.value = updatedUser;
+  localStorage.setItem('wallet_user', JSON.stringify(updatedUser));
+};
+
+const handleTransferToContact = (contactUserId, contactNickname) => {
+  currentView.value = 'dashboard';
+  recipientInput.value = contactUserId.toString();
+  // Scroll to transfer section
+  setTimeout(() => {
+    const transferSection = document.querySelector('.action-card');
+    if (transferSection) transferSection.scrollIntoView({ behavior: 'smooth' });
+  }, 100);
+};
+
+const formatDate = (timestamp) => {
+  const date = new Date(timestamp);
+  return date.toLocaleString(); // Or format as desired
+};
+
+const generateReceipt = (txn) => {
+  const doc = new jsPDF();
+  
+  // Header
+  doc.setFillColor(30, 41, 59); // Slate-800
+  doc.rect(0, 0, 210, 40, 'F');
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(22);
+  doc.text("Neuro-Wallet", 105, 20, { align: "center" });
+  
+  // Content
+  doc.setTextColor(0, 0, 0);
+  doc.setFontSize(16);
+  doc.text("Transaction Receipt", 105, 60, { align: "center" });
+  
+  doc.setFontSize(12);
+  doc.text(`Reference ID: #${txn.id}`, 20, 80);
+  doc.text(`Date: ${formatDate(txn.timestamp)}`, 20, 90);
+  doc.text(`Type: ${txn.senderId === user.value.id ? 'Outgoing' : 'Incoming'}`, 20, 100);
+  
+  doc.setFontSize(14);
+  doc.text(`Amount: RM ${txn.amount.toFixed(2)}`, 20, 120);
+  
+  doc.setFontSize(10);
+  doc.setTextColor(100, 100, 100);
+  doc.text("This receipt is computer generated and requires no signature.", 105, 280, { align: "center" });
+
+  doc.save(`receipt_${txn.id}.pdf`);
+};
+
+// Toggle mobile menu
+const toggleMobileMenu = () => {
+  isMobileMenuOpen.value = !isMobileMenuOpen.value;
+};
+
+// Close mobile menu on navigate
+const setView = (view) => {
+  currentView.value = view;
+  isMobileMenuOpen.value = false;
 };
 
 onMounted(() => {
-  if (user.value) fetchWalletData();
+  if (user.value && token.value) fetchWalletData();
 });
 </script>
 
@@ -141,8 +273,8 @@ onMounted(() => {
     <!-- DASHBOARD VIEW -->
     <template v-if="user">
       <nav class="midnight-nav">
-        <div class="max-w-7xl mx-auto flex justify-between items-center w-full px-6 md:px-12">
-          <div class="flex items-center gap-4 cursor-pointer" @click="fetchWalletData">
+        <div class="max-w-7xl mx-auto flex justify-between items-center w-full px-6 md:px-12 relative">
+          <div class="flex items-center gap-4 cursor-pointer" @click="setView('dashboard')">
             <div class="logo-box-small">
               <i class="fa-solid fa-layer-group"></i>
             </div>
@@ -152,14 +284,53 @@ onMounted(() => {
             </div>
           </div>
           
-          <div class="flex items-center gap-4 md:gap-8">
-            <div class="hidden md:flex flex-col items-end pr-8 border-r border-white/10">
-              <span class="label-tiny">Account Node</span>
-              <span class="node-id">#00{{ user.id }}</span>
-            </div>
+          <!-- Desktop Navigation Menu -->
+          <div class="hidden lg:flex items-center gap-2">
+            <button @click="setView('dashboard')" :class="['nav-menu-btn', { active: currentView === 'dashboard' }]">
+              <i class="fas fa-home"></i>
+            </button>
+            <button @click="setView('contacts')" :class="['nav-menu-btn', { active: currentView === 'contacts' }]">
+              <i class="fas fa-address-book"></i>
+            </button>
+            <button @click="setView('recurring')" :class="['nav-menu-btn', { active: currentView === 'recurring' }]">
+              <i class="fas fa-sync"></i>
+            </button>
+            <button @click="setView('payment-requests')" :class="['nav-menu-btn', { active: currentView === 'payment-requests' }]">
+              <i class="fas fa-qrcode"></i>
+            </button>
+            <button @click="setView('approvals')" :class="['nav-menu-btn', { active: currentView === 'approvals' }]">
+              <i class="fas fa-check-circle"></i>
+            </button>
+            <button @click="setView('analytics')" :class="['nav-menu-btn', { active: currentView === 'analytics' }]">
+              <i class="fas fa-chart-line"></i>
+            </button>
+            <button @click="setView('notifications')" :class="['nav-menu-btn', { active: currentView === 'notifications' }]">
+              <i class="fas fa-bell"></i>
+              <span v-if="unreadNotifCount > 0" class="notif-badge">{{ unreadNotifCount }}</span>
+            </button>
+          </div>
+
+          <!-- Mobile Menu Toggle -->
+          <div class="lg:hidden flex items-center">
+             <button @click="toggleMobileMenu" class="mobile-menu-toggle">
+               <i class="fas" :class="isMobileMenuOpen ? 'fa-times' : 'fa-bars'"></i>
+             </button>
+          </div>
+          
+          <div class="hidden lg:flex items-center gap-4">
+            <!-- User Profile Menu -->
             <div class="flex items-center gap-3">
-              <span class="hidden sm:inline text-xs font-bold text-white/60 capitalize">{{ user.username }}</span>
-              <button @click="logout" class="icon-btn-logout" title="Disconnect Session">
+              <div @click="currentView = 'profile'" class="flex items-center gap-3 cursor-pointer group">
+                <div class="w-10 h-10 rounded-full border border-white/20 overflow-hidden relative">
+                   <img :src="user.avatarUrl ? `http://localhost:8080${user.avatarUrl}` : 'https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y'" 
+                        class="w-full h-full object-cover" />
+                </div>
+                <span class="hidden sm:inline text-xs font-bold text-white/60 group-hover:text-white transition-colors capitalize">
+                  {{ user.username }}
+                </span>
+              </div>
+              
+              <button @click="logout" class="icon-btn-logout ml-2" title="Disconnect Session">
                 <i class="fa-solid fa-power-off"></i>
               </button>
             </div>
@@ -167,8 +338,56 @@ onMounted(() => {
         </div>
       </nav>
 
+      <!-- Mobile Menu Overlay -->
+      <Transition name="fade">
+        <div v-if="isMobileMenuOpen" class="mobile-menu-overlay">
+          <div class="mobile-menu-content">
+            <button @click="setView('dashboard')" :class="['mobile-nav-btn', { active: currentView === 'dashboard' }]">
+               <i class="fas fa-home"></i> Home
+            </button>
+            <button @click="setView('contacts')" :class="['mobile-nav-btn', { active: currentView === 'contacts' }]">
+               <i class="fas fa-address-book"></i> Contacts
+            </button>
+            <button @click="setView('recurring')" :class="['mobile-nav-btn', { active: currentView === 'recurring' }]">
+               <i class="fas fa-sync"></i> Recurring
+            </button>
+            <button @click="setView('payment-requests')" :class="['mobile-nav-btn', { active: currentView === 'payment-requests' }]">
+               <i class="fas fa-qrcode"></i> Requests
+            </button>
+            <button @click="setView('approvals')" :class="['mobile-nav-btn', { active: currentView === 'approvals' }]">
+               <i class="fas fa-check-circle"></i> Approvals
+            </button>
+            <button @click="setView('analytics')" :class="['mobile-nav-btn', { active: currentView === 'analytics' }]">
+               <i class="fas fa-chart-line"></i> Analytics
+            </button>
+            <button @click="setView('notifications')" :class="['mobile-nav-btn', { active: currentView === 'notifications' }]">
+               <div class="flex items-center gap-2">
+                 <i class="fas fa-bell"></i> Notifications
+                 <span v-if="unreadNotifCount > 0" class="mobile-badge">{{ unreadNotifCount }}</span>
+               </div>
+            </button>
+            
+            <div class="mobile-menu-divider"></div>
+            
+            <div class="flex items-center gap-3 px-4 py-3" @click="setView('profile')">
+              <div class="w-8 h-8 rounded-full border border-white/20 overflow-hidden relative">
+                 <img :src="user.avatarUrl ? `http://localhost:8080${user.avatarUrl}` : 'https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y'" 
+                      class="w-full h-full object-cover" />
+              </div>
+              <span class="text-white text-sm font-bold">{{ user.username }}</span>
+            </div>
+            
+            <button @click="logout" class="mobile-nav-btn logout">
+               <i class="fa-solid fa-power-off"></i> Disconnect
+            </button>
+          </div>
+        </div>
+      </Transition>
+
       <main class="max-w-7xl mx-auto p-6 md:p-12 w-full flex-grow">
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 md:gap-12 animate-in">
+        
+        <!-- DASHBOARD CONTENT -->
+        <div v-if="currentView === 'dashboard'" class="grid grid-cols-1 lg:grid-cols-12 gap-8 md:gap-12 animate-in">
           
           <!-- SIDEBAR: BALANCE & TRANSFER -->
           <div class="lg:col-span-4 space-y-8">
@@ -185,13 +404,26 @@ onMounted(() => {
                </div>
             </div>
 
+            <div class="midnight-card qr-identity-card">
+              <h4 class="card-title">Node Identity</h4>
+              <div class="flex flex-col items-center gap-4">
+                <div class="bg-white p-4 rounded-xl">
+                  <qrcode-vue :value="String(user.id)" :size="160" level="H" />
+                </div>
+                <div class="text-center">
+                  <p class="text-purple-400 font-mono text-xl font-bold">Node #{{ user.id }}</p>
+                  <p class="text-slate-400 text-xs mt-2 uppercase tracking-wider font-bold">Scan to initiate transfer</p>
+                </div>
+              </div>
+            </div>
+
             <div class="midnight-card action-card p-10">
               <h4 class="card-title">Initiate Transfer</h4>
               <div class="space-y-8">
                 <div class="input-group">
                    <div class="input-wrapper">
-                    <input v-model="recipientId" type="number" id="recipient" placeholder=" " required>
-                    <label for="recipient" class="floating-label">Recipient Node ID</label>
+                    <input v-model="recipientInput" type="text" id="recipient" placeholder=" " required>
+                    <label for="recipient" class="floating-label">Recipient (Node ID or Username)</label>
                     <i class="fa-solid fa-hashtag input-icon"></i>
                   </div>
                 </div>
@@ -240,11 +472,14 @@ onMounted(() => {
                     </div>
                   </div>
                   <div class="text-right">
-                    <p :class="t.senderId === user.id ? 'amount-debit' : 'amount-credit'">
-                      {{ t.senderId === user.id ? '-' : '+' }}RM {{ t.amount.toFixed(2) }}
-                    </p>
-                    <p class="ledger-status">Verified</p>
-                  </div>
+                <p class="font-bold" :class="t.senderId === user.id ? 'amount-debit' : 'amount-credit'">
+                  {{ t.senderId === user.id ? '-' : '+' }} RM {{ t.amount.toFixed(2) }}
+                </p>
+                <p class="ledger-status">{{ formatDate(t.timestamp) }}</p>
+                <button @click="generateReceipt(t)" class="text-[10px] text-purple-400 hover:text-purple-300 mt-1">
+                  <i class="fa-solid fa-file-pdf mr-1"></i> Receipt
+                </button>
+              </div>
                 </div>
               </TransitionGroup>
 
@@ -255,6 +490,42 @@ onMounted(() => {
             </div>
           </div>
         </div>
+
+        <!-- PROFILE VIEW -->
+        <div v-else-if="currentView === 'profile'" class="max-w-4xl mx-auto animate-in">
+          <ProfileSettings :user="user" @update-user="updateUserData" @logout="logout" />
+        </div>
+
+        <!-- CONTACTS VIEW -->
+        <div v-else-if="currentView === 'contacts'" class="animate-in">
+          <Contacts :user="user" @transfer-to-contact="handleTransferToContact" />
+        </div>
+
+        <!-- NOTIFICATIONS VIEW -->
+        <div v-else-if="currentView === 'notifications'" class="animate-in">
+          <Notifications ref="notificationsRef" :user="user" />
+        </div>
+
+        <!-- RECURRING PAYMENTS VIEW -->
+        <div v-else-if="currentView === 'recurring'" class="animate-in">
+          <RecurringPayments :user="user" />
+        </div>
+
+        <!-- PAYMENT REQUESTS VIEW -->
+        <div v-else-if="currentView === 'payment-requests'" class="animate-in">
+          <PaymentRequests :user="user" />
+        </div>
+
+        <!-- PENDING APPROVALS VIEW -->
+        <div v-else-if="currentView === 'approvals'" class="animate-in">
+          <PendingApprovals :user="user" />
+        </div>
+
+        <!-- ANALYTICS VIEW -->
+        <div v-else-if="currentView === 'analytics'" class="animate-in">
+          <Analytics :user="user" />
+        </div>
+
       </main>
     </template>
 
@@ -306,6 +577,7 @@ onMounted(() => {
         </div>
       </div>
     </template>
+
 
   </div>
 </template>
@@ -389,6 +661,9 @@ onMounted(() => {
 
 /* Dashboard Elements */
 .balance-card { padding: 4rem 2rem; border-color: rgba(99, 102, 241, 0.2); }
+.qr-identity-card { padding: 2.5rem 2rem; border-color: rgba(139, 92, 246, 0.2); background: linear-gradient(135deg, rgba(99, 102, 241, 0.05), rgba(139, 92, 246, 0.05)); }
+.qr-identity-card .bg-white { box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); }
+.action-card { border-color: rgba(255, 255, 255, 0.08); }
 .amount-large { font-size: 4rem; font-weight: 800; letter-spacing: -0.05em; color: white; line-height: 1; }
 .currency { font-size: 1.5rem; font-weight: 800; color: var(--accent-primary); }
 .balance-display { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 1rem; }
@@ -408,7 +683,7 @@ onMounted(() => {
 .ledger-title { font-weight: 700; font-size: 1.1rem; }
 .ledger-subtitle { font-size: 10px; color: var(--text-muted); font-weight: 800; margin-top: 4px; letter-spacing: 0.1em; }
 .ledger-status { font-size: 9px; font-weight: 800; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.2em; margin-top: 6px; }
-.amount-debit { font-weight: 800; font-size: 1.35rem; color: white; }
+.amount-debit { font-weight: 800; font-size: 1.35rem; color: #f87171; } /* Changed to red for debit */
 .amount-credit { font-weight: 800; font-size: 1.35rem; color: #10b981; }
 
 /* Icons */
@@ -559,6 +834,12 @@ input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-app
 .cursor-pointer { cursor: pointer; }
 .transition-colors { transition: color 0.3s; }
 .w-full { width: 100%; }
+.w-10 { width: 2.5rem; }
+.h-full { height: 100%; }
+.h-10 { height: 2.5rem; }
+.rounded-full { border-radius: 9999px; }
+.overflow-hidden { overflow: hidden; }
+.object-cover { object-fit: cover; }
 .max-w-7xl { max-width: 80rem; }
 .mx-auto { margin-left: auto; margin-right: auto; }
 .p-6 { padding: 1.5rem; }
@@ -599,5 +880,161 @@ input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-app
   .lg\:col-span-4 { grid-column: span 4 / span 4; }
   .lg\:col-span-8 { grid-column: span 8 / span 8; }
   .lg\:grid-cols-12 { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  .lg\:flex { display: flex; }
+  .lg\:hidden { display: none; }
+}
+
+/* Navigation Menu Buttons */
+.nav-menu-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #94a3b8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  font-size: 1.1rem;
+}
+
+.nav-menu-btn:hover {
+  background: rgba(99, 102, 241, 0.15);
+  border-color: rgba(99, 102, 241, 0.3);
+  color: #6366f1;
+  transform: translateY(-2px);
+}
+
+.nav-menu-btn.active {
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  border-color: transparent;
+  color: white;
+  box-shadow: 0 10px 20px -5px rgba(99, 102, 241, 0.4);
+}
+
+.notif-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  background: #ef4444;
+  color: white;
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 10px;
+  min-width: 18px;
+  text-align: center;
+  box-shadow: 0 2px 8px rgba(239, 68, 68, 0.6);
+}
+
+/* Mobile Navigation Styles */
+.mobile-menu-toggle {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.2rem;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+.mobile-menu-toggle:active { transform: scale(0.95); }
+
+.mobile-menu-overlay {
+  position: fixed;
+  top: 85px; /* Height of nav bar approx */
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(15, 23, 42, 0.95);
+  backdrop-filter: blur(20px);
+  z-index: 40;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.mobile-menu-content {
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 24px;
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.mobile-nav-btn {
+  width: 100%;
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  background: transparent;
+  border: none;
+  border-radius: 16px;
+  color: #94a3b8;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-align: left;
+}
+
+.mobile-nav-btn i { width: 24px; text-align: center; font-size: 1.1rem; }
+
+.mobile-nav-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: white;
+}
+
+.mobile-nav-btn.active {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
+  color: #818cf8;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.mobile-nav-btn.logout {
+  margin-top: 0.5rem;
+  color: #f87171;
+}
+.mobile-nav-btn.logout:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+}
+
+.mobile-menu-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  margin: 0.5rem 1rem;
+}
+
+.mobile-badge {
+  background: #ef4444;
+  color: white;
+  font-size: 0.75rem;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+/* Transitions */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+  transform: translateY(-10px);
 }
 </style>

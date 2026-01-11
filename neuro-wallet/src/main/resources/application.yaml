@@ -9,3 +9,17 @@ spring:
     hibernate:
       ddl-auto: update # Automatically creates tables for you
     show-sql: true # Helpful for debugging during the demo
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 5MB
+      max-request-size: 5MB
+
+# JWT Configuration
+jwt:
+  secret: neuroWalletSecretKey123456789012345678901234567890123456789012345678901234567890
+  expiration: 36000000 # 10 hours in milliseconds
+
+# File Upload Configuration
+file:
+  upload-dir: uploads/avatars
